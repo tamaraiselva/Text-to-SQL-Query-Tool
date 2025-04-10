@@ -1,236 +1,321 @@
-import streamlit as st
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.exc import SQLAlchemyError
-import pandas as pd
-import torch
 from dotenv import load_dotenv
+import streamlit as st
+import os
+import mysql.connector
+import pandas as pd
+import google.generativeai as genai
+import sqlite3
+import psycopg2
+from sqlalchemy import create_engine
+import traceback
 
+# Configuration
 load_dotenv()
+try:
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        st.error("❌ GOOGLE_API_KEY not found in .env file")
+        st.stop()
+    genai.configure(api_key=api_key)
+except Exception as e:
+    st.error(f"❌ Error loading configuration: {str(e)}")
+    st.stop()
 
-# --- Configuration ---
-DEFAULT_MODEL = "facebook/opt-125m"  # Smaller, publicly available model
-DB_TYPES = {
-    "SQLite": "sqlite",
-    "MySQL": "mysql+pymysql",
-    "PostgreSQL": "postgresql",
-    "MS SQL Server": "mssql+pyodbc"
-}
-
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "db_engine" not in st.session_state:
-    st.session_state.db_engine = None
-if "db_schema" not in st.session_state:
-    st.session_state.db_schema = {}
-
-# --- Model Loading (CPU-compatible) ---
-@st.cache_resource
-def load_model(model_name=DEFAULT_MODEL):
+# Test Database Connection
+def test_db_connection(db_type, host, user, password, database, port=None):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="cpu",  # Force CPU
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32  # Optimize for CPU
-        )
-        return tokenizer, model
-    except Exception as e:
-        st.error(f"Failed to load model: {str(e)}")
-        return None, None
-
-# --- SQL Generation (CPU-compatible) ---
-def generate_sql(tokenizer, model, prompt, max_length=300):
-    try:
-        inputs = tokenizer(prompt, return_tensors="pt").to("cpu")  # Force CPU
-        outputs = model.generate(
-            **inputs,
-            max_length=max_length,
-            num_return_sequences=1,
-            temperature=0.7,
-            do_sample=True
-        )
-        return tokenizer.decode(outputs[0], skip_special_tokens=True)
-    except Exception as e:
-        st.error(f"Error during SQL generation: {str(e)}")
-        return None
-
-# --- Database Functions ---
-def create_db_connection(db_type, host, port, database, username, password):
-    try:
-        if db_type == "SQLite":
-            connection_string = f"sqlite:///{database}"
+        if db_type == "MySQL":
+            conn = mysql.connector.connect(
+                host=host,
+                user=user,
+                password=password,
+                database=database,
+                port=port or 3306
+            )
+            conn.close()
+            return True, "✅ Successfully connected to MySQL database"
+        elif db_type == "PostgreSQL":
+            conn = psycopg2.connect(
+                host=host,
+                user=user,
+                password=password,
+                database=database,
+                port=port or 5432
+            )
+            conn.close()
+            return True, "✅ Successfully connected to PostgreSQL database"
+        elif db_type == "SQLite":
+            if not os.path.exists(database):
+                return False, "❌ SQLite database file not found"
+            conn = sqlite3.connect(database)
+            conn.close()
+            return True, "✅ Successfully connected to SQLite database"
         else:
-            connection_string = f"{DB_TYPES[db_type]}://{username}:{password}@{host}:{port}/{database}"
-        
-        engine = create_engine(connection_string)
-        st.session_state.db_engine = engine
-        return engine
-    except Exception as e:
-        st.error(f"Database connection failed: {str(e)}")
-        return None
+            return False, f"❌ Unsupported database type: {db_type}"
+    except mysql.connector.Error as err:
+        if err.errno == mysql.connector.errorcode.ER_ACCESS_DENIED_ERROR:
+            return False, "❌ Access denied. Please check your username and password"
+        elif err.errno == mysql.connector.errorcode.ER_BAD_DB_ERROR:
+            return False, f"❌ Database '{database}' does not exist"
+        else:
+            return False, f"❌ MySQL Error: {str(err)}"
+    except psycopg2.Error as err:
+        return False, f"❌ PostgreSQL Error: {str(err)}"
+    except sqlite3.Error as err:
+        return False, f"❌ SQLite Error: {str(err)}"
+    except Exception as err:
+        return False, f"❌ Unexpected error: {str(err)}"
 
-def get_db_schema(engine):
-    inspector = inspect(engine)
-    schema = {}
-    
-    for table_name in inspector.get_table_names():
-        columns = []
-        for column in inspector.get_columns(table_name):
-            columns.append({
-                "name": column["name"],
-                "type": str(column["type"]),
-                "nullable": column["nullable"],
-                "primary_key": column.get("primary_key", False)
-            })
-        
-        schema[table_name] = {
-            "columns": columns,
-            "primary_key": inspector.get_pk_constraint(table_name).get("constrained_columns", [])
-        }
-    
-    st.session_state.db_schema = schema
-    return schema
-
-def format_schema_for_prompt(schema):
-    prompt = "Database schema:\n"
-    for table_name, table_info in schema.items():
-        prompt += f"- Table {table_name}:\n"
-        for column in table_info["columns"]:
-            prompt += f"  - {column['name']} ({column['type']})"
-            if column["primary_key"]:
-                prompt += " (PRIMARY KEY)"
-            prompt += "\n"
-        if table_info["primary_key"]:
-            prompt += f"  Primary key: {', '.join(table_info['primary_key'])}\n"
-    return prompt
-
-def execute_query(engine, query_str):
+# Database Connection
+def get_db_connection(db_type, host, user, password, database, port=None):
     try:
-        with engine.connect() as connection:
-            result = connection.execute(text(query_str))
-            if result.returns_rows:
-                df = pd.DataFrame(result.fetchall(), columns=result.keys())
-                return df
-            else:
-                return f"Query executed successfully. Rows affected: {result.rowcount}"
-    except SQLAlchemyError as e:
-        return f"Error executing query: {str(e)}"
+        if db_type == "MySQL":
+            return mysql.connector.connect(
+                host=host,
+                user=user,
+                password=password,
+                database=database,
+                port=port or 3306
+            )
+        elif db_type == "PostgreSQL":
+            return psycopg2.connect(
+                host=host,
+                user=user,
+                password=password,
+                database=database,
+                port=port or 5432
+            )
+        elif db_type == "SQLite":
+            if not os.path.exists(database):
+                raise FileNotFoundError(f"SQLite database file not found: {database}")
+            return sqlite3.connect(database)
+        else:
+            raise ValueError(f"Unsupported database type: {db_type}")
+    except mysql.connector.Error as err:
+        if err.errno == mysql.connector.errorcode.ER_ACCESS_DENIED_ERROR:
+            st.error("❌ Database access denied. Please check your username and password.")
+        elif err.errno == mysql.connector.errorcode.ER_BAD_DB_ERROR:
+            st.error(f"❌ Database '{database}' does not exist.")
+        else:
+            st.error(f"❌ MySQL Error: {str(err)}")
+        st.stop()
+    except psycopg2.Error as err:
+        st.error(f"❌ PostgreSQL Error: {str(err)}")
+        st.stop()
+    except sqlite3.Error as err:
+        st.error(f"❌ SQLite Error: {str(err)}")
+        st.stop()
+    except Exception as err:
+        st.error(f"❌ Unexpected error during database connection: {str(err)}")
+        st.stop()
+
+# AI Response Generation
+def get_gemini_response(question, prompt):
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        response = model.generate_content([prompt[0], question])
+        if not response.text:
+            raise ValueError("Empty response from AI model")
+        return response.text
+    except Exception as e:
+        st.error(f"❌ AI Error: {str(e)}")
+        st.error("Please check if your Google API key is valid and has sufficient quota.")
+        st.stop()
+
+# Query Execution
+def execute_sql_query(sql_query, db_type, host, user, password, database, port=None):
+    sql_query = sql_query.strip().strip("```sql").strip("```")
+    
+    try:
+        conn = get_db_connection(db_type, host, user, password, database, port)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(sql_query)
+        except Exception as e:
+            st.error(f"❌ SQL Query Error: {str(e)}")
+            st.error("Please check your SQL query syntax and table structure.")
+            return None, None
+        
+        if cursor.description:
+            columns = [col[0] for col in cursor.description]
+            rows = cursor.fetchall()
+            return columns, rows
+        return None, None
+        
+    except Exception as err:
+        st.error(f"❌ Database Error: {str(err)}")
+        return None, None
+    finally:
+        try:
+            if hasattr(conn, 'close'):
+                cursor.close()
+                conn.close()
+        except Exception as e:
+            st.warning(f"⚠️ Warning: Error while closing database connection: {str(e)}")
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Text-to-SQL Query Tool", layout="wide")
-st.title("📊 Text-to-SQL Query Tool")
-
-# Sidebar for configuration
-with st.sidebar:
-    st.header("Configuration")
+def main():
+    st.set_page_config(page_icon="icons8-database.gif", page_title="Text-to-SQL Query Tool", layout="wide")
+    st.title("📊 Text-to-SQL Query Tool")
     
-    # Model selection
-    model_option = st.selectbox(
-        "Select Model",
-        ["facebook/opt-125m", "facebook/opt-350m", "facebook/opt-1.3b"],
-        index=0
-    )
+    # Initialize session state for database connection
+    if 'db_connected' not in st.session_state:
+        st.session_state.db_connected = False
+    if 'db_config' not in st.session_state:
+        st.session_state.db_config = {}
     
-    # Database connection
-    st.subheader("Database Connection")
-    db_type = st.selectbox("Database Type", list(DB_TYPES.keys()), index=0)
-    
-    if db_type != "SQLite":
-        col1, col2 = st.columns(2)
-        host = col1.text_input("Host", "localhost")
-        port = col2.text_input("Port", "3306" if db_type == "MySQL" else "5432")
-        database = st.text_input("Database Name", "mydatabase")
-        username = st.text_input("Username", "root")
-        password = st.text_input("Password", type="password")
-    else:
-        database = st.text_input("Database File Path", "example.db")
-        host, port, username, password = "", "", "", ""
-    
-    if st.button("Connect to Database"):
-        with st.spinner("Connecting..."):
-            engine = create_db_connection(db_type, host, port, database, username, password)
-            if engine:
-                st.success("Connected successfully!")
-                get_db_schema(engine)
-            else:
-                st.error("Connection failed")
-
-# Main interface
-tab1, tab2 = st.tabs(["Query", "Database Schema"])
-
-with tab1:
-    # Chat interface
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
-    if prompt := st.chat_input("Ask a question about your data"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            full_response = ""
+    # Database Connection Settings
+    with st.sidebar:
+        st.title("📊 Text-to-SQL Query Tool")
+        st.header("Database Settings")
+        try:
+            db_type = st.selectbox(
+                "Database Type *",
+                ["MySQL", "PostgreSQL", "SQLite"],
+                index=0
+            )
             
-            if st.session_state.db_engine is None:
-                full_response = "⚠️ Please connect to a database first."
+            if db_type != "SQLite":
+                db_host = st.text_input("Host *", value="localhost")
+                db_user = st.text_input("Username *", value="root")
+                db_password = st.text_input("Password *", type="password")
+                db_port = st.number_input("Port *", min_value=1, max_value=65535, 
+                                        value=3306 if db_type == "MySQL" else 5432)
+            
+            if db_type == "SQLite":
+                db_path = st.text_input("Database File Path *")
             else:
-                # Prepare the prompt with schema
-                schema_prompt = format_schema_for_prompt(st.session_state.db_schema)
-                full_prompt = f"{schema_prompt}\n\nQuestion: {prompt}\n\nSQL Query:"
-                
-                # Load model if not already loaded
-                if "tokenizer" not in st.session_state or "model" not in st.session_state:
-                    with st.spinner("Loading model..."):
-                        st.session_state.tokenizer, st.session_state.model = load_model(model_option)
-                
-                # Generate SQL
-                with st.spinner("Generating SQL query..."):
-                    sql_query = generate_sql(
-                        st.session_state.tokenizer,
-                        st.session_state.model,
-                        full_prompt
-                    )
-                
-                if sql_query:
-                    full_response += f"```sql\n{sql_query}\n```"
-                    
-                    # Execute the query
-                    with st.spinner("Executing query..."):
-                        result = execute_query(st.session_state.db_engine, sql_query)
-                    
-                    if isinstance(result, pd.DataFrame):
-                        full_response += "\n\n**Query Results:**"
-                        st.dataframe(result)
+                db_name = st.text_input("Database Name *")
+            
+            # Add a submit button for database settings
+            if st.button("Connect to Database", type="primary"):
+                # Validate required fields
+                if db_type == "SQLite":
+                    if not db_path:
+                        st.error("❌ Database file path is required")
                     else:
-                        full_response += f"\n\n**Execution Result:** {result}"
+                        # Test connection
+                        success, message = test_db_connection(db_type, None, None, None, db_path)
+                        if success:
+                            st.session_state.db_config = {
+                                "type": db_type,
+                                "path": db_path
+                            }
+                            st.session_state.db_connected = True
+                            st.success(message)
+                        else:
+                            st.error(message)
                 else:
-                    full_response = "Failed to generate SQL query."
-            
-            message_placeholder.markdown(full_response)
+                    if not all([db_host, db_user, db_password, db_name]):
+                        st.error("❌ All fields are required")
+                    else:
+                        # Test connection
+                        success, message = test_db_connection(db_type, db_host, db_user, db_password, db_name, db_port)
+                        if success:
+                            st.session_state.db_config = {
+                                "type": db_type,
+                                "host": db_host,
+                                "user": db_user,
+                                "password": db_password,
+                                "database": db_name,
+                                "port": db_port
+                            }
+                            st.session_state.db_connected = True
+                            st.success(message)
+                        else:
+                            st.error(message)
+        except Exception as e:
+            st.error(f"❌ Error in database settings UI: {str(e)}")
+            st.stop()
+    
+    # Only show the query interface if database is connected
+    if not st.session_state.db_connected:
+        st.warning("⚠️ Please configure and connect to your database first")
+        return
+    
+    prompt = [
+        """You are a healthcare SQL expert. Database schema:
+        PATIENTS (patient_id, first_name, last_name, dob, gender, phone, insurance_id)
+        DOCTORS (doctor_id, first_name, last_name, specialization, department_id, license_number, phone)
+        DEPARTMENTS (department_id, name, head_doctor_id)
+        APPOINTMENTS (appointment_id, patient_id, doctor_id, appointment_date, status)
+        MEDICAL_RECORDS (record_id, patient_id, doctor_id, diagnosis, prescription, record_date)
+        LAB_RESULTS (lab_id, patient_id, test_name, test_date, result_value, reference_range)
         
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
-
-with tab2:
-    if st.session_state.db_engine:
-        st.subheader("Database Schema Information")
+        Rules:
+        1. Use explicit JOIN syntax
+        2. Format dates using DATE_FORMAT()
+        3. Always qualify column names with table aliases
+        4. Include relevant WHERE clauses
+        5. Handle NULL values appropriately"""
+    ]
+    
+    try:
+        question = st.text_area("Enter your healthcare data question:", 
+                              placeholder="e.g., Show patients with cholesterol levels above 200 mg/dL",
+                              height=100)
         
-        if st.session_state.db_schema:
-            for table_name, table_info in st.session_state.db_schema.items():
-                with st.expander(f"Table: {table_name}"):
-                    st.write("Columns:")
-                    cols = st.columns(3)
-                    for i, column in enumerate(table_info["columns"]):
-                        col_idx = i % 3
-                        cols[col_idx].code(f"{column['name']}: {column['type']}")
+        if st.button("Analyze Data"):
+            if not question:
+                st.warning("⚠️ Please enter a question")
+                return
+                
+            with st.spinner("🔍 Analyzing data..."):
+                try:
+                    # Generate and execute query
+                    sql = get_gemini_response(question, prompt)
                     
-                    if table_info["primary_key"]:
-                        st.write(f"Primary key: {', '.join(table_info['primary_key'])}")
-        else:
-            st.warning("No schema information available. Please connect to a database.")
-    else:
-        st.warning("No database connected. Please configure the connection in the sidebar.")
+                    # Prepare database parameters based on type
+                    if st.session_state.db_config["type"] == "SQLite":
+                        columns, data = execute_sql_query(sql, 
+                                                        st.session_state.db_config["type"],
+                                                        None, None, None, 
+                                                        st.session_state.db_config["path"])
+                    else:
+                        columns, data = execute_sql_query(sql, 
+                                                        st.session_state.db_config["type"],
+                                                        st.session_state.db_config["host"],
+                                                        st.session_state.db_config["user"],
+                                                        st.session_state.db_config["password"],
+                                                        st.session_state.db_config["database"],
+                                                        st.session_state.db_config["port"])
+                    
+                    # Display results
+                    st.subheader("Generated SQL Query")
+                    st.code(sql, language="sql")
+                    
+                    if columns and data:
+                        st.subheader("Analysis Results")
+                        df = pd.DataFrame(data, columns=columns)
+                        st.dataframe(df, use_container_width=True)
+                        
+                        # Basic visualizations
+                        if len(df) > 0:
+                            numeric_cols = df.select_dtypes(include=['number']).columns
+                            if not numeric_cols.empty:
+                                selected_col = st.selectbox("Select column to visualize:", numeric_cols)
+                                st.line_chart(df[selected_col])
+                    else:
+                        st.info("ℹ️ No results found for this query")
+                        
+                except Exception as e:
+                    st.error(f"❌ Error processing request: {str(e)}")
+                    st.error("Stack trace:")
+                    st.code(traceback.format_exc())
+    except Exception as e:
+        st.error(f"❌ Error in main UI: {str(e)}")
+        st.error("Stack trace:")
+        st.code(traceback.format_exc())
+    
+    # Sample questions sidebar
+    with st.sidebar:
+        st.markdown("### 💡 Sample Questions")
+        st.write("- List patients with cholesterol above 200 mg/dL")
+        st.write("- Show average lab results by test type")
+        st.write("- Find doctors with most appointments this month")
+        st.write("- Patients with multiple prescriptions in March 2024")
+        st.write("- Upcoming appointments for cardiology department")
+
+if __name__ == "__main__":
+    main()
