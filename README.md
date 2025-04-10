@@ -1,85 +1,92 @@
-# Text-to-SQL-Query-Tool
+# Text-to-SQL Query Tool
 
-This is a Streamlit-based web application that allows users to generate SQL queries from natural language input using Facebook OPT models. It supports connections to multiple database types and enables query execution and schema exploration.
+A Streamlit-based application that converts natural language questions into SQL queries and executes them against various database types.
 
 ## Features
 
-- Natural Language to SQL Conversion: Converts user queries into SQL statements using Transformer models.
+- 🤖 Natural Language to SQL conversion using Google's Gemini AI
+- 🔌 Support for multiple database types:
+  - MySQL
+  - PostgreSQL
+  - SQLite
+- 📊 Interactive data visualization
+- 🔒 Secure database connection handling
+- ⚡ Real-time query execution
+- 📝 Sample questions for healthcare data analysis
 
-- Database Connectivity: Supports SQLite, MySQL, PostgreSQL, and MS SQL Server.
+## Prerequisites
 
-- Schema Inspection: Fetches and displays database schema information.
+- Python 3.8+
+- MySQL/PostgreSQL/SQLite database
+- Google API key for Gemini AI
 
-- Query Execution: Runs the generated SQL queries and displays results.
+## Installation
 
-- Interactive Chat Interface: Enables a chat-based experience for asking database-related questions.
-
-
-## Requirements
-
-### Dependencies
-
-Ensure you have the following Python packages installed:
-
-```python
-pip install streamlit transformers sqlalchemy pandas torch python-dotenv pymysql pyodbc
-```
-
-### Environment Variables
-
-Create a `.env` file (optional) for storing sensitive database credentials.
-
-## Installation & Usage
-
-### Clone the Repository
-
-```python
-git clone https://github.com/tamaraiselva/Text-to-SQL-Query-Tool.git
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/Text-to-SQL-Query-Tool.git
 cd Text-to-SQL-Query-Tool
 ```
 
-## Run the Application
+2. Install required packages:
+```bash
+pip install -r requirements.txt
+```
 
-```py
+3. Create a `.env` file in the project root:
+```
+GOOGLE_API_KEY=your_google_api_key_here
+```
+
+## Usage
+
+1. Start the application:
+```bash
 streamlit run app.py
 ```
 
-## Configuration
+2. Configure database connection:
+   - Select database type
+   - Enter connection details
+   - Click "Connect to Database"
 
-### Model Selection
+3. Enter your question in natural language
+4. Click "Analyze Data" to execute the query
 
-The application supports multiple OPT models:
+## Database Schema
 
-- `facebook/opt-125m (default)`
+The application is pre-configured for healthcare data with the following schema:
 
-- `facebook/opt-350m`
+```sql
+PATIENTS (patient_id, first_name, last_name, dob, gender, phone, insurance_id)
+DOCTORS (doctor_id, first_name, last_name, specialization, department_id, license_number, phone)
+DEPARTMENTS (department_id, name, head_doctor_id)
+APPOINTMENTS (appointment_id, patient_id, doctor_id, appointment_date, status)
+MEDICAL_RECORDS (record_id, patient_id, doctor_id, diagnosis, prescription, record_date)
+LAB_RESULTS (lab_id, patient_id, test_name, test_date, result_value, reference_range)
+```
 
-- `facebook/opt-1.3b`
+## Sample Questions
 
-You can select the model from the sidebar.
+- List patients with cholesterol above 200 mg/dL
+- Show average lab results by test type
+- Find doctors with most appointments this month
+- Patients with multiple prescriptions in March 2024
+- Upcoming appointments for cardiology department
 
-### Database Connection
+## Error Handling
 
-Configure the database connection via the sidebar by selecting the Database Type and providing necessary credentials.
+The application includes comprehensive error handling for:
+- Database connection issues
+- Invalid credentials
+- SQL query errors
+- AI response generation
+- Missing required fields
 
-## Usage Guide
+## Contributing
 
-1. Connect to a Database via the sidebar.
-
-2. View Schema in the "Database Schema" tab.
-
-3. Ask Questions in the chat interface to generate SQL.
-
-4. Execute Queries to see results.
-
-## Acknowledgments
-
-1. Facebook OPT Models for NLP processing.
-
-2. Streamlit for UI development.
-
-3. SQLAlchemy for database interaction.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the `MIT` License.
+This project is licensed under the MIT License - see the LICENSE file for details.
